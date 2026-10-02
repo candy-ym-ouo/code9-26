@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { AlbumGapDto, InspirationDto, TimeAnchor, WeatherPhenomenon } from '@flil/shared';
 import { getDb, newId, nowIso, parseJson, toJson } from '../db.js';
 import { errors } from '../http/errors.js';
+import { requireInspiration } from './inspirations.js';
 import { toAlbumDto, toGapDto, toInspirationDto, type SerializeContext } from './serialization.js';
 import { loadTiming } from './windowEngine.js';
 import { fuzzSpotCached, type PlaceRow, type SpotRow } from './fuzzing.js';
@@ -64,11 +65,20 @@ export function listAlbums(libraryId: string): ReturnType<typeof toAlbumDto>[] {
   return rows.map(toAlbumDto);
 }
 
-export function albumItemIds(albumId: string): string[] {
+/**
+ * 册内条目 id —— 只返回属于本库的灵感卡。
+ * 越权条目（历史脏数据）一律不可见：缺口统计、详情、封面、快照都以此为界。
+ */
+export function albumItemIds(albumId: string, libraryId: string): string[] {
   return (
     getDb()
-      .prepare('SELECT inspiration_id FROM album_item WHERE album_id = ? ORDER BY sort_order, created_at')
-      .all(albumId) as { inspiration_id: string }[]
+      .prepare(
+        `SELECT ai.inspiration_id FROM album_item ai
+         JOIN inspiration i ON i.id = ai.inspiration_id
+         WHERE ai.album_id = ? AND i.library_id = ?
+         ORDER BY ai.sort_order, ai.created_at`,
+      )
+      .all(albumId, libraryId) as { inspiration_id: string }[]
   ).map((r) => r.inspiration_id);
 }
 
@@ -195,6 +205,8 @@ export function addItem(
   caption?: string | null,
 ): void {
   requireAlbum(albumId, libraryId);
+  // 入册锁定本库：跨库灵感卡一律 403，防止画册成为越权读取他库素材的通道
+  requireInspiration(inspirationId, libraryId);
   const db = getDb();
   const maxOrder = (
     db.prepare('SELECT COALESCE(MAX(sort_order), 0) AS m FROM album_item WHERE album_id = ?').get(albumId) as {
@@ -233,7 +245,7 @@ export function regenerateGaps(albumId: string, libraryId: string): AlbumGapDto[
   const db = getDb();
   const album = requireAlbum(albumId, libraryId);
   const rules = normalizeRules(album.rules);
-  const itemIds = albumItemIds(albumId);
+  const itemIds = albumItemIds(albumId, libraryId);
 
   const countTag = (tagIds: string[]): number => {
     if (!itemIds.length || !tagIds.length) return 0;
@@ -430,9 +442,15 @@ export function publishAlbum(
   const openRequired = listGaps(albumId).filter((g) => g.isRequired && g.status === 'open');
   if (openRequired.length > 0) throw errors.albumHasRequiredGaps(openRequired.length);
 
+  // 快照只打包本库内容：越权条目（历史脏数据）不进入不可变快照，也就到不了分享页
   const items = db
-    .prepare('SELECT * FROM album_item WHERE album_id = ? ORDER BY sort_order, created_at')
-    .all(albumId) as { inspiration_id: string; sort_order: number; caption: string | null }[];
+    .prepare(
+      `SELECT ai.* FROM album_item ai
+       JOIN inspiration i ON i.id = ai.inspiration_id
+       WHERE ai.album_id = ? AND i.library_id = ?
+       ORDER BY ai.sort_order, ai.created_at`,
+    )
+    .all(albumId, libraryId) as { inspiration_id: string; sort_order: number; caption: string | null }[];
 
   const payloadItems = items.map((item) => {
     const row = db.prepare('SELECT * FROM inspiration WHERE id = ?').get(item.inspiration_id) as
@@ -558,20 +576,24 @@ export function albumItemsDetailed(albumId: string, ctx: SerializeContext): Insp
   const rows = db
     .prepare(
       `SELECT i.* FROM album_item ai JOIN inspiration i ON i.id = ai.inspiration_id
-       WHERE ai.album_id = ? ORDER BY ai.sort_order, ai.created_at`,
+       WHERE ai.album_id = ? AND i.library_id = ?
+       ORDER BY ai.sort_order, ai.created_at`,
     )
-    .all(albumId) as Record<string, unknown>[];
+    .all(albumId, ctx.libraryId) as Record<string, unknown>[];
   return rows.map((r) =>
     toInspirationDto(r as unknown as Parameters<typeof toInspirationDto>[0], ctx, { withWindowSummary: false }),
   );
 }
 
-export function coverAsset(albumId: string): AssetRow | null {
+export function coverAsset(albumId: string, libraryId: string): AssetRow | null {
   const row = getDb()
     .prepare(
-      `SELECT a.* FROM album_item ai JOIN asset a ON a.inspiration_id = ai.inspiration_id
-       WHERE ai.album_id = ? ORDER BY ai.sort_order LIMIT 1`,
+      `SELECT a.* FROM album_item ai
+       JOIN inspiration i ON i.id = ai.inspiration_id
+       JOIN asset a ON a.inspiration_id = ai.inspiration_id
+       WHERE ai.album_id = ? AND i.library_id = ?
+       ORDER BY ai.sort_order LIMIT 1`,
     )
-    .get(albumId) as AssetRow | undefined;
+    .get(albumId, libraryId) as AssetRow | undefined;
   return row ?? null;
 }

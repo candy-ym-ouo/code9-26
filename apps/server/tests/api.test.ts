@@ -447,3 +447,87 @@ describe('E10 备份与质量门', () => {
     expect(Object.values(res.body.dirs).every((v) => v === 'ok')).toBe(true);
   });
 });
+
+describe('E11 画册越权隔离：入册锁定本库，封面/缺口/详情不暴露外部内容', () => {
+  let outsiderCardId = '';
+  let isolatedAlbumId = '';
+
+  it('跨库灵感卡入册被拒（403），不存在的卡 404', async () => {
+    const outsider = await call('post', '/api/auth/register', {
+      email: 'outsider@test.local',
+      password: 'password123',
+      displayName: '外部用户',
+    });
+    const saved = token;
+    token = outsider.body.token;
+    const card = await call('post', '/api/inspirations', { title: '他库的私密灵感' });
+    outsiderCardId = card.body.id;
+    token = saved;
+
+    const album = await call('post', '/api/albums', { title: '隔离测试册', rules: { totalMin: 1 } });
+    expect(album.status).toBe(201);
+    isolatedAlbumId = album.body.id;
+
+    const cross = await call('post', `/api/albums/${isolatedAlbumId}/items`, { inspirationId: outsiderCardId });
+    expect(cross.status).toBe(403);
+    expect(cross.body.error.code).toBe('LIBRARY_SCOPE_DENIED');
+
+    const missing = await call('post', `/api/albums/${isolatedAlbumId}/items`, { inspirationId: 'not-exist' });
+    expect(missing.status).toBe(404);
+  });
+
+  it('历史越权条目也不会从详情/封面/缺口/计数泄露，且发布仍被缺口拦截', async () => {
+    // 模拟修复前已写入的越权条目与外部素材（脏数据兜底防线）
+    const { getDb, newId, nowIso } = await import('../src/db.js');
+    const db = getDb();
+    const ts = nowIso();
+    const outsiderLibraryId = (
+      db.prepare('SELECT library_id FROM inspiration WHERE id = ?').get(outsiderCardId) as {
+        library_id: string;
+      }
+    ).library_id;
+    db.prepare(
+      "INSERT INTO album_item (id, album_id, inspiration_id, sort_order, added_by, created_at) VALUES (?,?,?,?,'manual',?)",
+    ).run(newId(), isolatedAlbumId, outsiderCardId, 10, ts);
+    db.prepare(
+      "INSERT INTO asset (id, library_id, inspiration_id, role, file_path, width, height, created_at, updated_at) VALUES (?,?,?,'reference',?,?,?,?,?)",
+    ).run(newId(), outsiderLibraryId, outsiderCardId, '/tmp/outsider-secret.jpg', 800, 600, ts, ts);
+
+    // 详情不暴露外部卡，计数不含外部条目
+    const detail = await call('get', `/api/albums/${isolatedAlbumId}`);
+    expect(detail.status).toBe(200);
+    expect(detail.body.items.map((i: { id: string }) => i.id)).not.toContain(outsiderCardId);
+    expect(detail.body.item.itemCount).toBe(0);
+
+    // 缺口不被外部内容闭合：totalMin=1 的 count 缺口仍然 open，发布仍被 409 拦截
+    const countGap = detail.body.gaps.find((g: { kind: string }) => g.kind === 'count');
+    expect(countGap.currentCount).toBe(0);
+    expect(countGap.status).toBe('open');
+    const blocked = await call('post', `/api/albums/${isolatedAlbumId}/publish`, { createShare: false });
+    expect(blocked.status).toBe(409);
+
+    // 封面不输出外部素材文件
+    const cover = await call('get', `/api/albums/${isolatedAlbumId}/cover`);
+    expect(cover.status).toBe(404);
+
+    // 列表计数与封面出口同样不含外部内容
+    const list = await call('get', '/api/albums');
+    const row = (list.body.items as { id: string; itemCount: number; coverThumbUrl: string | null }[]).find(
+      (a) => a.id === isolatedAlbumId,
+    );
+    expect(row?.itemCount).toBe(0);
+    expect(row?.coverThumbUrl).toBeNull();
+
+    // 越权条目可以移除（清理通道保持可用）
+    const rm = await call('delete', `/api/albums/${isolatedAlbumId}/items/${outsiderCardId}`);
+    expect(rm.status).toBe(200);
+  });
+
+  it('本库卡正常入册不受影响', async () => {
+    const res = await call('post', `/api/albums/${isolatedAlbumId}/items`, { inspirationId: cardId });
+    expect(res.status).toBe(201);
+    const detail = await call('get', `/api/albums/${isolatedAlbumId}`);
+    expect(detail.body.items.map((i: { id: string }) => i.id)).toContain(cardId);
+    expect(detail.body.item.itemCount).toBe(1);
+  });
+});

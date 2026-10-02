@@ -248,9 +248,14 @@ export function toPlanDto(row: Record<string, unknown>): PlanDto {
 export function toAlbumDto(row: Record<string, unknown>): AlbumDto {
   const db = getDb();
   const albumId = row.id as string;
-  const item = db.prepare('SELECT COUNT(*) AS n FROM album_item WHERE album_id = ?').get(albumId) as {
-    n: number;
-  };
+  // 只计本库条目：越权条目不可见，计数与封面出口必须与可见内容一致
+  const item = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM album_item ai
+       JOIN inspiration i ON i.id = ai.inspiration_id
+       WHERE ai.album_id = ? AND i.library_id = ?`,
+    )
+    .get(albumId, row.library_id) as { n: number };
   const gaps = db
     .prepare(
       "SELECT COUNT(*) AS n FROM album_gap WHERE album_id = ? AND is_required = 1 AND status = 'open'",

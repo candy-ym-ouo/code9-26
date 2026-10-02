@@ -189,15 +189,19 @@ publicShareRouter.get(
     const asset = db.prepare('SELECT * FROM asset WHERE id = ?').get(req.params.assetId) as AssetRow | undefined;
     if (!asset) throw errors.notFound('图片');
 
-    // 越权检查：该图片必须属于本次分享范围
+    // 越权检查：该图片必须属于本次分享范围，且灵感卡必须属于分享所在库
     let allowed = false;
     if (link.scope === 'inspiration') {
       allowed = asset.inspiration_id === link.scope_id;
     } else {
       allowed = Boolean(
         db
-          .prepare('SELECT 1 AS x FROM album_item WHERE album_id = ? AND inspiration_id = ?')
-          .get(link.scope_id, asset.inspiration_id),
+          .prepare(
+            `SELECT 1 AS x FROM album_item ai
+             JOIN inspiration i ON i.id = ai.inspiration_id
+             WHERE ai.album_id = ? AND ai.inspiration_id = ? AND i.library_id = ?`,
+          )
+          .get(link.scope_id, asset.inspiration_id, link.library_id),
       );
     }
     if (!allowed) {

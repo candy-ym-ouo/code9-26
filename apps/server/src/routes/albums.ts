@@ -234,7 +234,7 @@ albumRouter.get(
   ah(async (req, res) => {
     const ctx = ctxOf(req);
     requireAlbum(req.params.id, ctx.libraryId);
-    const asset = coverAsset(req.params.id);
+    const asset = coverAsset(req.params.id, ctx.libraryId);
     if (!asset) throw errors.notFound('封面图');
     res.sendFile(asset.thumb_path ?? asset.file_path);
   }),
