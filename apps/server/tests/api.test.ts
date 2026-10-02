@@ -447,3 +447,84 @@ describe('E10 备份与质量门', () => {
     expect(Object.values(res.body.dirs).every((v) => v === 'ok')).toBe(true);
   });
 });
+
+describe('E11 画册锁定本库：不得收录或暴露他库灵感', () => {
+  let otherToken = '';
+  let otherCardId = '';
+  let otherAlbumId = '';
+
+  it('第二个资料库注册并准备自己的灵感与画册', async () => {
+    const saved = token;
+    const other = await call('post', '/api/auth/register', {
+      email: 'other-owner@test.local',
+      password: 'password123',
+      displayName: '另一个库的所有者',
+    });
+    expect(other.status).toBe(201);
+    otherToken = other.body.token;
+    token = otherToken;
+
+    const card = await call('post', '/api/inspirations', { title: '他库的秘密灵感' });
+    expect(card.status).toBe(201);
+    otherCardId = card.body.id;
+
+    const album = await call('post', '/api/albums', { title: '他库画册', rules: { totalMin: 1 } });
+    expect(album.status).toBe(201);
+    otherAlbumId = album.body.id;
+    token = saved;
+  });
+
+  it('把他库灵感加入本库画册被拒绝（403），且本库画册不受污染', async () => {
+    const attack = await call('post', `/api/albums/${albumId}/items`, { inspirationId: otherCardId });
+    expect(attack.status).toBe(403);
+    expect(attack.body.error.code).toBe('LIBRARY_SCOPE_DENIED');
+
+    const detail = await call('get', `/api/albums/${albumId}`);
+    expect(detail.body.items.find((i: { id: string }) => i.id === otherCardId)).toBeUndefined();
+  });
+
+  it('画册详情、缺口计数与封面都不暴露外部内容', async () => {
+    const detail = await call('get', `/api/albums/${albumId}`);
+    expect(JSON.stringify(detail.body.items)).not.toContain(otherCardId);
+    const countGap = detail.body.gaps.find((g: { kind: string }) => g.kind === 'count');
+    expect(countGap.currentCount).toBe(detail.body.items.length);
+
+    const cover = await call('get', `/api/albums/${albumId}/cover`);
+    // 封面即便存在，也只能是本库素材：直接确认列表里没有他库灵感即可（封面为图片流无法比对 id）
+    expect([200, 404]).toContain(cover.status);
+  });
+
+  it('他库画册与快照对当前库不可见', async () => {
+    const detail = await call('get', `/api/albums/${otherAlbumId}`);
+    expect([403, 404]).toContain(detail.status);
+    const snapshots = await call('get', `/api/albums/${otherAlbumId}/snapshots`);
+    expect([403, 404]).toContain(snapshots.status);
+  });
+
+  it('不能用本库分享链接指向他库画册或他库灵感', async () => {
+    const shareAlbum = await call('post', '/api/share-links', {
+      scope: 'album',
+      scopeId: otherAlbumId,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(shareAlbum.status).toBe(403);
+    const shareInspiration = await call('post', '/api/share-links', {
+      scope: 'inspiration',
+      scopeId: otherCardId,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(shareInspiration.status).toBe(403);
+  });
+
+  it('对称地，他库也无法把本库灵感收入他的画册', async () => {
+    const saved = token;
+    token = otherToken;
+    const attack = await call('post', `/api/albums/${otherAlbumId}/items`, { inspirationId: cardId });
+    expect(attack.status).toBe(403);
+    const attack2 = await call('post', `/api/albums/${otherAlbumId}/items`, { inspirationId: albumId });
+    expect([403, 404]).toContain(attack2.status);
+    token = saved;
+  });
+});

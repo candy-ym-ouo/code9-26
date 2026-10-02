@@ -57,19 +57,34 @@ export function requireAlbum(albumId: string, libraryId: string): Record<string,
   return row;
 }
 
+/** 画册当前收录的本库灵感 id（画册锁定本库，跨库关系一律不算入册） */
+export function albumItemIds(albumId: string, libraryId: string): string[] {
+  return (
+    getDb()
+      .prepare(
+        `SELECT ai.inspiration_id AS inspiration_id
+         FROM album_item ai JOIN inspiration i ON i.id = ai.inspiration_id
+         WHERE ai.album_id = ? AND i.library_id = ?
+         ORDER BY ai.sort_order, ai.created_at`,
+      )
+      .all(albumId, libraryId) as { inspiration_id: string }[]
+  ).map((r) => r.inspiration_id);
+}
+
+/** 入册前校验灵感归属：只有本库、未删除的灵感才能加入本库画册 */
+function requireSameLibraryInspiration(inspirationId: string, libraryId: string): void {
+  const row = getDb()
+    .prepare('SELECT library_id FROM inspiration WHERE id = ? AND deleted_at IS NULL')
+    .get(inspirationId) as { library_id: string } | undefined;
+  if (!row) throw errors.notFound('灵感卡');
+  if (row.library_id !== libraryId) throw errors.scopeDenied();
+}
+
 export function listAlbums(libraryId: string): ReturnType<typeof toAlbumDto>[] {
   const rows = getDb()
     .prepare('SELECT * FROM album WHERE library_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC')
     .all(libraryId) as Record<string, unknown>[];
   return rows.map(toAlbumDto);
-}
-
-export function albumItemIds(albumId: string): string[] {
-  return (
-    getDb()
-      .prepare('SELECT inspiration_id FROM album_item WHERE album_id = ? ORDER BY sort_order, created_at')
-      .all(albumId) as { inspiration_id: string }[]
-  ).map((r) => r.inspiration_id);
 }
 
 export function listGaps(albumId: string): AlbumGapDto[] {
@@ -165,7 +180,13 @@ export function autoMatch(albumId: string, libraryId: string): { added: number; 
   const album = requireAlbum(albumId, libraryId);
   const rules = normalizeRules(album.rules);
   const currentCount = (
-    getDb().prepare('SELECT COUNT(*) AS n FROM album_item WHERE album_id = ?').get(albumId) as { n: number }
+    getDb()
+      .prepare(
+        `SELECT COUNT(*) AS n
+         FROM album_item ai JOIN inspiration i ON i.id = ai.inspiration_id
+         WHERE ai.album_id = ? AND i.library_id = ?`,
+      )
+      .get(albumId, libraryId) as { n: number }
   ).n;
   const need = Math.max(0, rules.totalMin - currentCount);
   if (need === 0) return { added: 0, scanned: 0 };
@@ -195,6 +216,8 @@ export function addItem(
   caption?: string | null,
 ): void {
   requireAlbum(albumId, libraryId);
+  // 入册锁定本库：外部资料库的灵感一律拒绝（避免 IDOR 与外部素材经画册泄漏）
+  requireSameLibraryInspiration(inspirationId, libraryId);
   const db = getDb();
   const maxOrder = (
     db.prepare('SELECT COALESCE(MAX(sort_order), 0) AS m FROM album_item WHERE album_id = ?').get(albumId) as {
@@ -218,11 +241,11 @@ export function reorderItems(albumId: string, libraryId: string, orderedIds: str
   const db = getDb();
   const run = db.transaction(() => {
     orderedIds.forEach((id, index) => {
-      db.prepare('UPDATE album_item SET sort_order = ? WHERE album_id = ? AND inspiration_id = ?').run(
-        (index + 1) * 10,
-        albumId,
-        id,
-      );
+      db.prepare(
+        `UPDATE album_item SET sort_order = ?
+         WHERE album_id = ? AND inspiration_id = ?
+           AND inspiration_id IN (SELECT id FROM inspiration WHERE library_id = ?)`,
+      ).run((index + 1) * 10, albumId, id, libraryId);
     });
   });
   run();
@@ -233,7 +256,7 @@ export function regenerateGaps(albumId: string, libraryId: string): AlbumGapDto[
   const db = getDb();
   const album = requireAlbum(albumId, libraryId);
   const rules = normalizeRules(album.rules);
-  const itemIds = albumItemIds(albumId);
+  const itemIds = albumItemIds(albumId, libraryId);
 
   const countTag = (tagIds: string[]): number => {
     if (!itemIds.length || !tagIds.length) return 0;
@@ -431,8 +454,13 @@ export function publishAlbum(
   if (openRequired.length > 0) throw errors.albumHasRequiredGaps(openRequired.length);
 
   const items = db
-    .prepare('SELECT * FROM album_item WHERE album_id = ? ORDER BY sort_order, created_at')
-    .all(albumId) as { inspiration_id: string; sort_order: number; caption: string | null }[];
+    .prepare(
+      `SELECT ai.inspiration_id AS inspiration_id, ai.sort_order AS sort_order, ai.caption AS caption
+       FROM album_item ai JOIN inspiration i ON i.id = ai.inspiration_id
+       WHERE ai.album_id = ? AND i.library_id = ?
+       ORDER BY ai.sort_order, ai.created_at`,
+    )
+    .all(albumId, libraryId) as { inspiration_id: string; sort_order: number; caption: string | null }[];
 
   const payloadItems = items.map((item) => {
     const row = db.prepare('SELECT * FROM inspiration WHERE id = ?').get(item.inspiration_id) as
@@ -535,8 +563,17 @@ export function summarizeConditions(
   return parts.length ? `${parts.join('；')}。` : '本册暂未形成统一的条件描述。';
 }
 
-export function getSnapshot(albumId: string, version?: number): Record<string, unknown> | null {
+export function getSnapshot(
+  albumId: string,
+  libraryId: string,
+  version?: number,
+): Record<string, unknown> | null {
   const db = getDb();
+  // 快照随画册走：跨库画册不得读取
+  const album = db
+    .prepare('SELECT id FROM album WHERE id = ? AND deleted_at IS NULL AND library_id = ?')
+    .get(albumId, libraryId);
+  if (!album) throw errors.scopeDenied();
   const row = version
     ? (db.prepare('SELECT * FROM album_snapshot WHERE album_id = ? AND version = ?').get(albumId, version) as
         | Record<string, unknown>
@@ -545,11 +582,18 @@ export function getSnapshot(albumId: string, version?: number): Record<string, u
         | Record<string, unknown>
         | undefined);
   if (!row) return null;
+  const payload = parseJson<Record<string, unknown>>(row.payload, {});
+  // 纵深防御：即便历史快照里残留了外部条目，也不允许从载荷里读出来
+  if (Array.isArray(payload.items)) {
+    const scopedIds = new Set(albumItemIds(albumId, libraryId));
+    payload.items = (payload.items as Record<string, unknown>[]).filter((it) =>
+      scopedIds.has(String(it.inspirationId)));
+  }
   return {
     version: row.version as number,
     payloadHash: row.payload_hash as string,
     createdAt: row.created_at as string,
-    payload: parseJson<Record<string, unknown>>(row.payload, {}),
+    payload,
   };
 }
 
@@ -557,21 +601,26 @@ export function albumItemsDetailed(albumId: string, ctx: SerializeContext): Insp
   const db = getDb();
   const rows = db
     .prepare(
-      `SELECT i.* FROM album_item ai JOIN inspiration i ON i.id = ai.inspiration_id
-       WHERE ai.album_id = ? ORDER BY ai.sort_order, ai.created_at`,
+      `SELECT i.* FROM album_item ai
+       JOIN inspiration i ON i.id = ai.inspiration_id AND i.library_id = ?
+       WHERE ai.album_id = ?
+       ORDER BY ai.sort_order, ai.created_at`,
     )
-    .all(albumId) as Record<string, unknown>[];
+    .all(ctx.libraryId, albumId) as Record<string, unknown>[];
   return rows.map((r) =>
     toInspirationDto(r as unknown as Parameters<typeof toInspirationDto>[0], ctx, { withWindowSummary: false }),
   );
 }
 
-export function coverAsset(albumId: string): AssetRow | null {
+export function coverAsset(albumId: string, libraryId: string): AssetRow | null {
   const row = getDb()
     .prepare(
-      `SELECT a.* FROM album_item ai JOIN asset a ON a.inspiration_id = ai.inspiration_id
-       WHERE ai.album_id = ? ORDER BY ai.sort_order LIMIT 1`,
+      `SELECT a.* FROM album_item ai
+       JOIN inspiration i ON i.id = ai.inspiration_id AND i.library_id = ?
+       JOIN asset a ON a.inspiration_id = ai.inspiration_id
+       WHERE ai.album_id = ?
+       ORDER BY ai.sort_order LIMIT 1`,
     )
-    .get(albumId) as AssetRow | undefined;
+    .get(libraryId, albumId) as AssetRow | undefined;
   return row ?? null;
 }

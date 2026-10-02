@@ -131,6 +131,7 @@ publicShareRouter.get(
   '/share/:token',
   ah(async (req, res) => {
     const link = validateShareToken(req.params.token, passwordFrom(req));
+    const db = getDb();
     const ctx = {
       libraryId: link.library_id,
       role: 'member' as const,
@@ -139,7 +140,12 @@ publicShareRouter.get(
     };
 
     if (link.scope === 'album') {
-      const snapshot = getSnapshot(link.scope_id);
+      // 分享链接绑定资料库：scope_id 指向的画册必须属于该库，防止链接复用到他库画册
+      const album = db
+        .prepare('SELECT id FROM album WHERE id = ? AND library_id = ? AND deleted_at IS NULL')
+        .get(link.scope_id, link.library_id);
+      if (!album) throw errors.notFound('画册');
+      const snapshot = getSnapshot(link.scope_id, link.library_id);
       const items = albumItemsDetailed(link.scope_id, ctx);
       logAccess(link.id, true);
       return ok(res, {
@@ -189,15 +195,21 @@ publicShareRouter.get(
     const asset = db.prepare('SELECT * FROM asset WHERE id = ?').get(req.params.assetId) as AssetRow | undefined;
     if (!asset) throw errors.notFound('图片');
 
-    // 越权检查：该图片必须属于本次分享范围
+    // 越权检查：该图片必须属于本次分享范围，且不得跨资料库
     let allowed = false;
     if (link.scope === 'inspiration') {
-      allowed = asset.inspiration_id === link.scope_id;
+      allowed = asset.inspiration_id === link.scope_id && asset.library_id === link.library_id;
     } else {
       allowed = Boolean(
         db
-          .prepare('SELECT 1 AS x FROM album_item WHERE album_id = ? AND inspiration_id = ?')
-          .get(link.scope_id, asset.inspiration_id),
+          .prepare(
+            `SELECT 1 AS x
+             FROM album al
+             JOIN album_item ai ON ai.album_id = al.id
+             JOIN inspiration i ON i.id = ai.inspiration_id AND i.library_id = al.library_id
+             WHERE al.id = ? AND al.library_id = ? AND ai.inspiration_id = ? AND al.deleted_at IS NULL`,
+          )
+          .get(link.scope_id, link.library_id, asset.inspiration_id),
       );
     }
     if (!allowed) {

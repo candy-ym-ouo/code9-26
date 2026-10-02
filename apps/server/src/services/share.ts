@@ -32,6 +32,15 @@ export function createShareLink(params: {
 }): ShareLinkRow {
   if (!config.enableShare) throw errors.badRequest('分享功能已被服务端关闭（ENABLE_SHARE=false）');
 
+  // 分享对象必须属于当前资料库，禁止为他库对象创建链接
+  const scopeTable = params.scope === 'album' ? 'album' : 'inspiration';
+  const scopeRow = getDb()
+    .prepare(
+      `SELECT id FROM ${scopeTable} WHERE id = ? AND library_id = ?${params.scope === 'album' ? ' AND deleted_at IS NULL' : ' AND deleted_at IS NULL'}`,
+    )
+    .get(params.scopeId, params.libraryId);
+  if (!scopeRow) throw errors.scopeDenied();
+
   // 安全底线：exact / g100 一律强制降级为 g500（不抛错，避免"手填就绕过"）
   const level = assertShareFuzzLevel(params.fuzzLevel);
   const days = Math.min(Math.max(1, params.expiresInDays), config.shareMaxExpireDays);

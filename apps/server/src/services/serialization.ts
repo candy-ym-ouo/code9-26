@@ -248,9 +248,14 @@ export function toPlanDto(row: Record<string, unknown>): PlanDto {
 export function toAlbumDto(row: Record<string, unknown>): AlbumDto {
   const db = getDb();
   const albumId = row.id as string;
-  const item = db.prepare('SELECT COUNT(*) AS n FROM album_item WHERE album_id = ?').get(albumId) as {
-    n: number;
-  };
+  const libraryId = row.library_id as string;
+  const item = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM album_item ai
+       JOIN inspiration i ON i.id = ai.inspiration_id AND i.library_id = ?
+       WHERE ai.album_id = ?`,
+    )
+    .get(libraryId, albumId) as { n: number };
   const gaps = db
     .prepare(
       "SELECT COUNT(*) AS n FROM album_gap WHERE album_id = ? AND is_required = 1 AND status = 'open'",

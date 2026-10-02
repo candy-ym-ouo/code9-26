@@ -225,7 +225,7 @@ albumRouter.get(
     const rows = getDb()
       .prepare('SELECT id, version, payload_hash, created_at FROM album_snapshot WHERE album_id = ? ORDER BY version DESC')
       .all(req.params.id);
-    ok(res, { items: rows, latest: getSnapshot(req.params.id) });
+    ok(res, { items: rows, latest: getSnapshot(req.params.id, ctx.libraryId) });
   }),
 );
 
@@ -234,7 +234,7 @@ albumRouter.get(
   ah(async (req, res) => {
     const ctx = ctxOf(req);
     requireAlbum(req.params.id, ctx.libraryId);
-    const asset = coverAsset(req.params.id);
+    const asset = coverAsset(req.params.id, ctx.libraryId);
     if (!asset) throw errors.notFound('封面图');
     res.sendFile(asset.thumb_path ?? asset.file_path);
   }),
